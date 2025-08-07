@@ -2,15 +2,20 @@
   "name": "html-refactor",
   "version": "1.0.0",
   "description": "A CLI tool to refactor HTML by extracting inline CSS and JavaScript into separate files.",
-  "main": "html-refactor.js",
+  "main": "tool-scripts/html-refactor.js",
   "bin": {
-    "html-refactor": "html-refactor.js",
-    "href": "html-refactor.js",
-    "htref": "html-refactor.js"
+    "html-refactor": "tool-scripts/html-refactor.js",
+    "href": "tool-scripts/html-refactor.js",
+    "htref": "tool-scripts/html-refactor.js"
   },
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "lint": "echo \"Linting not yet configured\""
+    "lint": "echo \"Linting not yet configured\"",
+    "start": "node tool-scripts/auto-dev.js",
+    "dev": "node tool-scripts/auto-dev.js",
+    "build": "node tool-scripts/build-prod.js",
+    "css": "node tool-scripts/build-css.js",
+    "refactor": "node tool-scripts/html-refactor.js"
   },
   "keywords": [
     "html",
@@ -39,13 +44,17 @@
     "fs-extra": "^11.2.0",
     "glob": "^10.3.10",
     "inquirer": "^8.2.4",
-    "yargs": "^17.7.2"
+    "yargs": "^17.7.2",
+    "chokidar": "^3.5.3",
+    "imagemin": "^8.0.1",
+    "imagemin-svgo": "^10.0.1",
+    "terser": "^5.15.1"
   },
   "engines": {
     "node": ">=14.0.0"
   },
   "files": [
-    "html-refactor.js",
+    "tool-scripts/",
     "README.md",
     "LICENSE"
   ]

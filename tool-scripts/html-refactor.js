@@ -279,10 +279,14 @@ function getDefaultConfig(projectR) {
   return {
     projectRoot: projectRoot,
     htmlSourcePatterns: ['**/*.html'], // Default to scan all HTML files
-    stylesOutputDir: DEFAULT_STYLES_OUTPUT_DIR,
+    stylesOutputDir: DEFAULT_STYLES_OUTPUT_DIR, // Used if cssOutputDirStrategy is 'centralized'
+    cssOutputDirStrategy: 'centralized', // 'centralized' or 'relativeToHtml'
     jsOutputDirStrategy: 'relativeToHtml', // 'relativeToHtml' or 'centralized'
     jsCentralOutputDir: 'js/extracted', // Used if jsOutputDirStrategy is 'centralized'
     compiledCssLinkDir: DEFAULT_COMPILED_CSS_LINK_DIR,
+    copyToDist: false, // Feature disabled by default
+    distDir: 'dist/', // Default distribution directory
+    distSourceRoot: 'src/', // The source folder to mirror in dist
     ignorePatterns: [ // Common patterns to ignore by default
         'node_modules/**',
         '**/node_modules/**', // For nested node_modules
@@ -417,10 +421,21 @@ async function interactiveConfigSetup(currentProjectRoot, existingConfig = null,
       filter: (input) => input.split(',').map(s => s.trim()).filter(s => s.length > 0),
     },
     {
+      type: 'list',
+      name: 'cssOutputDirStrategy',
+      message: 'How to save extracted CSS source files?',
+      choices: [
+        { name: 'In a central directory (e.g., styles/extracted)', value: 'centralized' },
+        { name: 'Relative to each HTML file (alongside the HTML)', value: 'relativeToHtml' },
+      ],
+      default: initialValues.cssOutputDirStrategy,
+    },
+    {
       type: 'input',
       name: 'stylesOutputDir',
-      message: 'Directory to save extracted CSS files (relative to project root):',
+      message: 'Central directory for extracted CSS (if chosen, relative to project root):',
       default: initialValues.stylesOutputDir,
+      when: (answers) => answers.cssOutputDirStrategy === 'centralized',
     },
     {
       type: 'list',
@@ -484,6 +499,27 @@ async function interactiveConfigSetup(currentProjectRoot, existingConfig = null,
         message: 'Maximum length for generated CSS/JS filename bases (excluding extension/hashes):',
         default: initialValues.maxFilenameLength,
         validate: (input) => (Number.isInteger(input) && input > 10 && input < 200) ? true : 'Must be an integer between 11 and 199.',
+    },
+    {
+        type: 'confirm',
+        name: 'copyToDist',
+        message: 'Enable copying of refactored HTML and its JS files to a distribution directory (like a build step)?',
+        default: initialValues.copyToDist,
+    },
+    {
+        type: 'input',
+        name: 'distDir',
+        message: 'Distribution directory to copy files to (relative to project root):',
+        default: initialValues.distDir,
+        when: (answers) => answers.copyToDist,
+    },
+    {
+        type: 'input',
+        name: 'distSourceRoot',
+        message: 'Base source directory to mirror in the distribution directory (e.g., "src" or "public"):',
+        default: initialValues.distSourceRoot,
+        when: (answers) => answers.copyToDist,
+        validate: (input) => input.trim().length > 0 ? true : 'This value cannot be empty.',
     }
   ];
 
@@ -517,9 +553,30 @@ async function interactiveConfigSetup(currentProjectRoot, existingConfig = null,
  * Generates a unique CSS class name for extracted inline styles.
  * @returns {string} A unique CSS class name (e.g., 'extracted-inline-style-1').
  */
-function generateUniqueCssClassName() {
-  uniqueClassCounter++;
-  return `extracted-inline-style-${uniqueClassCounter}`;
+/**
+ * Normalizes a CSS style string to ensure consistent ordering of properties for deduplication.
+ * @param {string} style - The raw CSS style string (e.g., 'color: blue; font-weight: bold;').
+ * @returns {string} A normalized style string (e.g., 'color:blue;font-weight:bold').
+ */
+function normalizeStyleString(style) {
+  if (!style) return '';
+  return style
+    .split(';')
+    .map(s => s.trim())
+    .filter(s => s)
+    .sort()
+    .join(';');
+}
+
+/**
+ * Generates a unique and deterministic CSS class name from a style string.
+ * Uses a hash of the normalized style to ensure the same style always gets the same class.
+ * @param {string} normalizedStyle - The normalized style string from normalizeStyleString.
+ * @returns {string} A short, unique class name like 'css-a1b2c3d4'.
+ */
+function generateClassFromStyle(normalizedStyle) {
+    const hash = crypto.createHash('sha256').update(normalizedStyle).digest('hex');
+    return `css-${hash.substring(0, 8)}`;
 }
 
 /**
@@ -616,8 +673,9 @@ function generateCssFileBaseName(htmlFilePath, config) {
 async function extractCssFromHtml($, htmlFilePath, htmlFileBaseName) {
   let allExtractedCss = '';
   let cssModifiedInHtml = false;
+  const styleMap = new Map(); // To track unique styles and their generated classes
 
-  // 1. Extract from <style> tags
+  // 1. Extract from <style> tags (these are not deduplicated, as they are presumed to be unique blocks)
   $('style').each((index, element) => {
     const $styleTag = $(element);
     const styleContent = $styleTag.html();
@@ -629,21 +687,32 @@ async function extractCssFromHtml($, htmlFilePath, htmlFileBaseName) {
     }
   });
 
-  // 2. Extract from style attributes
+  // 2. Extract and deduplicate from style attributes
   $('[style]').each((index, element) => {
     const $element = $(element);
-    const inlineStyle = $element.attr('style');
-    if (inlineStyle && inlineStyle.trim() !== '') {
-      const className = generateUniqueCssClassName(); // Generate a unique class
-      $element.addClass(className); // Add class to the element
-      $element.removeAttr('style'); // Remove original style attribute
-      // Ensure style rules end with a semicolon
-      const trimmedStyle = inlineStyle.trim();
-      const styleRule = trimmedStyle.endsWith(';') ? trimmedStyle : `${trimmedStyle};`;
-      allExtractedCss += `\n/* Style for .${className} from element in ${htmlFileBaseName}.html */\n.${className} {\n  ${styleRule}\n}\n`;
-      cssModifiedInHtml = true;
-      loggerInstance.debug(`Extracted inline style from an element in ${htmlFileBaseName}.html to class .${className}.`);
+    const rawStyle = $element.attr('style');
+    if (!rawStyle || !rawStyle.trim()) return;
+
+    const normalizedStyle = normalizeStyleString(rawStyle);
+    let className;
+
+    if (styleMap.has(normalizedStyle)) {
+      // This exact style has been seen before, reuse the class.
+      className = styleMap.get(normalizedStyle);
+      loggerInstance.debug(`Reusing class '${className}' for identical style.`);
+    } else {
+      // This is a new, unique style.
+      className = generateClassFromStyle(normalizedStyle);
+      styleMap.set(normalizedStyle, className);
+
+      // Add the new rule to our collected CSS
+      const styleRule = normalizedStyle.replace(/;/g, ';\n  '); // Pretty print
+      allExtractedCss += `\n/* Style for .${className} from ${htmlFileBaseName}.html */\n.${className} {\n  ${styleRule}\n}\n`;
     }
+
+    $element.addClass(className);
+    $element.removeAttr('style');
+    cssModifiedInHtml = true;
   });
 
   return { cssContent: allExtractedCss.trim(), cssModified: cssModifiedInHtml };
@@ -664,11 +733,17 @@ async function saveCssFile(cssContent, cssFileBaseName, htmlFilePath, config, is
     return null;
   }
 
-  const stylesDirFullPath = path.resolve(config.projectRoot, config.stylesOutputDir);
   const newCssFileName = `${cssFileBaseName}.css`;
-  const newCssFileFullPath = path.join(stylesDirFullPath, newCssFileName);
-  const relativeNewCssPath = path.relative(config.projectRoot, newCssFileFullPath).replace(/\\/g, '/');
+  let newCssFileFullPath;
 
+  if (config.cssOutputDirStrategy === 'relativeToHtml') {
+    newCssFileFullPath = path.join(path.dirname(htmlFilePath), newCssFileName);
+  } else { // 'centralized'
+    const stylesDirFullPath = path.resolve(config.projectRoot, config.stylesOutputDir);
+    newCssFileFullPath = path.join(stylesDirFullPath, newCssFileName);
+  }
+
+  const relativeNewCssPath = path.relative(config.projectRoot, newCssFileFullPath).replace(/\\/g, '/');
   loggerInstance.debug(`Target CSS file path for extracted styles: ${relativeNewCssPath}`);
 
   if (isDryRun) {
@@ -770,10 +845,12 @@ function addCssLinkToHtmlHead($, htmlFilePath, cssFileBaseName, config) {
  * @param {string} htmlFileBaseName - Sanitized base name of the HTML file (for naming JS files).
  * @param {object} config - The application configuration object.
  * @param {boolean} isDryRun - If true, simulates extraction without actual file modification.
- * @returns {Promise<boolean>} True if any JS was extracted and HTML was (or would be) modified.
+ * @returns {Promise<{jsModifiedInHtml: boolean, extractedJsFiles: Array<{sourcePath: string, content: string}>}>}
+ *          An object containing a flag if the HTML was modified and an array of objects for each extracted JS file.
  */
 async function extractJsFromHtml($, htmlFilePath, htmlFileBaseName, config, isDryRun) {
   let jsModifiedInHtml = false;
+  const extractedJsFiles = []; // To hold data about extracted files for the caller
   const scriptTagsToProcess = [];
 
   // Collect script tags with inline content
@@ -786,7 +863,7 @@ async function extractJsFromHtml($, htmlFilePath, htmlFileBaseName, config, isDr
   });
 
   if (scriptTagsToProcess.length === 0) {
-    return false; // No inline scripts to extract
+    return { jsModifiedInHtml: false, extractedJsFiles: [] }; // No inline scripts to extract
   }
 
   // Use the pre-sanitized htmlFileBaseName for JS file generation
@@ -814,6 +891,12 @@ async function extractJsFromHtml($, htmlFilePath, htmlFileBaseName, config, isDr
       relativeJsFilePathForLogging = path.relative(config.projectRoot, jsFileFullPath);
     }
     relativeJsFilePathForLogging = relativeJsFilePathForLogging.replace(/\\/g, '/');
+
+    // Add file info for the caller, regardless of dry run or not.
+    // This helps in dry run logging and actual copy operations later.
+    const jsFileData = { sourcePath: jsFileFullPath, content: scriptContent };
+    extractedJsFiles.push(jsFileData);
+
 
     if (isDryRun) {
       let srcDryRunPath = jsFileNameForSrcAttr; // Default for relativeToHtml
@@ -843,6 +926,8 @@ async function extractJsFromHtml($, htmlFilePath, htmlFileBaseName, config, isDr
         }
         relativeJsFilePathForLogging = relativeJsFilePathForLogging.replace(/\\/g, '/');
         loggerInstance.warn(`JS file for script in ${path.basename(htmlFilePath)} already existed. Saving new script to unique file: ${relativeJsFilePathForLogging}`);
+        // Update the path in the object we're tracking
+        jsFileData.sourcePath = jsFileFullPath;
       }
 
       await fs.ensureDir(path.dirname(jsFileFullPath)); // Ensure directory exists
@@ -864,10 +949,13 @@ async function extractJsFromHtml($, htmlFilePath, htmlFileBaseName, config, isDr
     } catch (error) {
       loggerInstance.error(`Failed to save or update JS file ${relativeJsFilePathForLogging}: ${error.message}`);
       loggerInstance.debug(error.stack);
+      // Remove the failed file from our list of extracted files
+      const failedIndex = extractedJsFiles.findIndex(f => f.sourcePath === jsFileFullPath);
+      if (failedIndex > -1) extractedJsFiles.splice(failedIndex, 1);
       // Continue to the next script if one fails
     }
   }
-  return jsModifiedInHtml;
+  return { jsModifiedInHtml, extractedJsFiles };
 }
 
 /**
@@ -913,32 +1001,73 @@ async function processHtmlFile(htmlFilePath, config, isDryRun) {
 
     // Extract JS from inline <script> tags
     const sanitizedHtmlBaseForJs = sanitizeStringForFilename(htmlFileRawBaseName); // Sanitize once for JS naming
-    const jsModified = await extractJsFromHtml($, htmlFilePath, sanitizedHtmlBaseForJs, config, isDryRun);
+    const { jsModifiedInHtml, extractedJsFiles } = await extractJsFromHtml($, htmlFilePath, sanitizedHtmlBaseForJs, config, isDryRun);
 
     // Determine if any effective change occurred that requires saving the HTML
-    const effectiveChangeMade = styleTagsAndAttrsRemoved || jsModified || newCssLinkAdded;
+    const effectiveChangeMade = styleTagsAndAttrsRemoved || jsModifiedInHtml || newCssLinkAdded;
+    let fileWasModified = false;
 
     if (effectiveChangeMade) {
+      const finalHtmlContent = $.html(); // Get the modified HTML content
+
       if (isDryRun) {
         loggerInstance.info(`[DRY RUN] HTML file ${relativeHtmlPath} would be modified due to extracted content or new links.`);
-        return true; // Indicates a change would occur
+        fileWasModified = true; // Indicates a change would occur
+      } else {
+        // Only write if the content has actually changed to avoid unnecessary file writes
+        if (finalHtmlContent !== initialHtmlContent) {
+          if (config.createBackups) {
+            const backupPath = `${htmlFilePath}.bak`;
+            const relativeBackupPath = path.relative(config.projectRoot, backupPath).replace(/\\/g, '/');
+            loggerInstance.debug(`Creating backup: ${relativeBackupPath}`);
+            await fs.copyFile(htmlFilePath, backupPath); // Create backup
+          }
+          await fs.writeFile(htmlFilePath, finalHtmlContent, 'utf-8');
+          loggerInstance.success(`Successfully updated and saved changes to: ${relativeHtmlPath}`);
+          fileWasModified = true; // File was modified
+        } else {
+          loggerInstance.info(`No effective content changes to write for ${relativeHtmlPath} (content identical after processing).`);
+        }
       }
 
-      const finalHtmlContent = $.html(); // Get the modified HTML content
-      // Only write if the content has actually changed to avoid unnecessary file writes
-      if (finalHtmlContent !== initialHtmlContent) {
-        if (config.createBackups) {
-          const backupPath = `${htmlFilePath}.bak`;
-          const relativeBackupPath = path.relative(config.projectRoot, backupPath).replace(/\\/g, '/');
-          loggerInstance.debug(`Creating backup: ${relativeBackupPath}`);
-          await fs.copyFile(htmlFilePath, backupPath); // Create backup
+      // --- New "Copy to Dist" Logic ---
+      if (config.copyToDist) {
+        const distSourceRootAbsolute = path.resolve(config.projectRoot, config.distSourceRoot);
+        const distDirAbsolute = path.resolve(config.projectRoot, config.distDir);
+
+        // 1. Handle the HTML file
+        const htmlDestPath = path.join(distDirAbsolute, path.relative(distSourceRootAbsolute, htmlFilePath));
+        const htmlDestPathRelative = path.relative(config.projectRoot, htmlDestPath).replace(/\\/g, '/');
+
+        if (isDryRun) {
+            loggerInstance.info(`[DRY RUN] Would copy modified HTML to: ${htmlDestPathRelative}`);
+        } else {
+            try {
+                await fs.ensureDir(path.dirname(htmlDestPath));
+                await fs.writeFile(htmlDestPath, finalHtmlContent, 'utf-8');
+                loggerInstance.info(`Copied modified HTML to: ${htmlDestPathRelative}`);
+            } catch (e) {
+                loggerInstance.error(`Failed to copy HTML to dist directory ${htmlDestPathRelative}: ${e.message}`);
+            }
         }
-        await fs.writeFile(htmlFilePath, finalHtmlContent, 'utf-8');
-        loggerInstance.success(`Successfully updated and saved changes to: ${relativeHtmlPath}`);
-        return true; // File was modified
+
+        // 2. Handle the extracted JS files
+        for (const jsFile of extractedJsFiles) {
+            const jsDestPath = path.join(distDirAbsolute, path.relative(distSourceRootAbsolute, jsFile.sourcePath));
+            const jsDestPathRelative = path.relative(config.projectRoot, jsDestPath).replace(/\\/g, '/');
+             if (isDryRun) {
+                loggerInstance.info(`[DRY RUN] Would copy extracted JS to: ${jsDestPathRelative}`);
+            } else {
+                try {
+                    await fs.copy(jsFile.sourcePath, jsDestPath);
+                    loggerInstance.info(`Copied extracted JS to: ${jsDestPathRelative}`);
+                } catch(e) {
+                    loggerInstance.error(`Failed to copy JS file to dist ${jsDestPathRelative}: ${e.message}`);
+                }
+            }
+        }
       }
-      loggerInstance.info(`No effective content changes to write for ${relativeHtmlPath} (content identical after processing).`);
-      return false; // No actual change in content
+      return fileWasModified;
     }
 
     loggerInstance.info(`No inline CSS/JS extracted, or no HTML modifications needed for: ${relativeHtmlPath}.`);
@@ -966,33 +1095,34 @@ async function runRefactorProcess(config, isDryRun) {
   }
 
   // Ensure output directories exist (or log if dry run)
-  const stylesDirFullPath = path.resolve(config.projectRoot, config.stylesOutputDir);
-  const stylesDirRelative = path.relative(config.projectRoot, stylesDirFullPath).replace(/\\/g, '/');
-  if (!isDryRun) {
+  if (config.cssOutputDirStrategy === 'centralized' && !isDryRun) {
+    const stylesDirFullPath = path.resolve(config.projectRoot, config.stylesOutputDir);
     try {
-      await fs.ensureDir(stylesDirFullPath);
-      loggerInstance.info(`Styles output directory ensured at: ${stylesDirRelative}`);
-    } catch (e) {
-      loggerInstance.error(`Failed to create styles output directory '${stylesDirRelative}': ${e.message}. Aborting.`);
-      return;
+        await fs.ensureDir(stylesDirFullPath);
+        loggerInstance.info(`Centralized styles output directory ensured at: ${path.relative(config.projectRoot, stylesDirFullPath)}`);
+    } catch(e) {
+        loggerInstance.error(`Failed to create centralized styles output directory: ${e.message}`);
     }
-  } else {
-     loggerInstance.info(`[DRY RUN] Would ensure styles output directory at: ${stylesDirRelative}`);
   }
 
-  if (config.jsOutputDirStrategy === 'centralized') {
+  // Ensure dist directory exists if feature is enabled
+  if (config.copyToDist && !isDryRun) {
+    const distDirFullPath = path.resolve(config.projectRoot, config.distDir);
+    try {
+        await fs.ensureDir(distDirFullPath);
+        loggerInstance.info(`Distribution directory ensured at: ${path.relative(config.projectRoot, distDirFullPath)}`);
+    } catch (e) {
+        loggerInstance.error(`Failed to create distribution directory: ${e.message}`);
+    }
+  }
+
+  if (config.jsOutputDirStrategy === 'centralized' && !isDryRun) {
     const centralJsDir = path.resolve(config.projectRoot, config.jsCentralOutputDir);
-    const centralJsDirRelative = path.relative(config.projectRoot, centralJsDir).replace(/\\/g, '/');
-     if (!isDryRun) {
-        try {
-            await fs.ensureDir(centralJsDir);
-            loggerInstance.info(`Centralized JS output directory ensured at: ${centralJsDirRelative}`);
-        } catch (e) {
-            loggerInstance.error(`Failed to create centralized JS output directory '${centralJsDirRelative}': ${e.message}. JS extraction to this dir may fail.`);
-            // Continue, but JS extraction might fail for centralized strategy
-        }
-    } else {
-        loggerInstance.info(`[DRY RUN] Would ensure centralized JS output directory at: ${centralJsDirRelative}`);
+     try {
+        await fs.ensureDir(centralJsDir);
+        loggerInstance.info(`Centralized JS output directory ensured at: ${path.relative(config.projectRoot, centralJsDir)}`);
+    } catch (e) {
+        loggerInstance.error(`Failed to create centralized JS output directory: ${e.message}.`);
     }
   }
 
@@ -1086,12 +1216,19 @@ async function cli() {
   const argv = await yargs(hideBin(process.argv))
     .scriptName(SCRIPT_PRIMARY_COMMAND)
     .usage(`Usage: $0 [options] (CLI aliases: href, htref)`)
-    .command('$0', 'Refactor HTML files: extract inline styles & scripts, update links.', () => {}, async (args) => {
+    .command('$0', 'Refactor HTML files: extract inline styles & scripts, update links.', (yargs) => {
+        yargs.option('dry-run', {
+            alias: 'd',
+            type: 'boolean',
+            description: 'Simulate the refactoring process without modifying any files.',
+            default: false,
+        });
+    }, async (args) => {
         let projectRoot = args.projectRoot ? path.resolve(args.projectRoot) : null;
         let rootDetectionMethod = 'CLI argument';
 
         if (!projectRoot) {
-            const detected = findProjectRoot(process.cwd()); // Detect from CWD if not provided
+            const detected = findProjectRoot(__dirname); // Detect from script's dir
             projectRoot = detected.projectRoot;
             rootDetectionMethod = detected.method;
         }
@@ -1141,7 +1278,18 @@ async function cli() {
 
         await runRefactorProcess(config, args.dryRun);
     })
-    // Define CLI options
+    .command('build', 'Run the full production build process.', () => {}, (argv) => {
+        const { buildProduction } = require('./build-prod.js');
+        buildProduction();
+    })
+    .command('dev', 'Start the development watcher.', () => {}, (argv) => {
+        const { startDevWatcher } = require('./auto-dev.js');
+        startDevWatcher();
+    })
+    .command('css', 'Run only the CSS build process.', () => {}, (argv) => {
+        const { buildCss } = require('./build-css.js');
+        buildCss();
+    })
     .option('init', {
       alias: 'i',
       type: 'boolean',
@@ -1153,12 +1301,6 @@ async function cli() {
       type: 'string',
       description: 'Specify the project root directory. Overrides auto-detection and config file value.',
       coerce: p => path.resolve(p), // Ensure it's made absolute if provided
-    })
-    .option('dry-run', {
-      alias: 'd',
-      type: 'boolean',
-      description: 'Simulate the refactoring process without modifying any files. Shows what would change.',
-      default: false,
     })
     .option('log-level', {
       alias: 'l',
